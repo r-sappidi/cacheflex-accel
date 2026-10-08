@@ -1,0 +1,1 @@
+../../../scripts/run_qwen_projection_v2.py

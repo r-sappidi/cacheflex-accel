@@ -1,0 +1,1 @@
+../../../scripts/collect_qwen_components.py

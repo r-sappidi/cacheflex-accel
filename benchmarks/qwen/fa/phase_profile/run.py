@@ -1,0 +1,269 @@
+"""Isolated serial FA-39 queue using retained simulator and shared resource broker."""
+import os
+os.environ.update(OPENBLAS_NUM_THREADS='1',OMP_NUM_THREADS='1',MKL_NUM_THREADS='1',NUMBA_NUM_THREADS='1',PYTHONDONTWRITEBYTECODE='1')
+import ast,json,time,hashlib,subprocess,resource,signal,fcntl,traceback,re,sys,shutil
+from pathlib import Path
+R=Path(__file__).resolve().parents[4];H=Path(__file__).resolve().parent
+sys.path[:0]=[str(R/'scripts'),str(R/'benchmarks/cacheflex_flash_attention'),str(R/'results/parallel_overlap_20260930')]
+import broker,numpy as np
+from plan import cases,parameters,work,argv,control_path,service
+from run_access_timing import stats
+from fa_headroom_profiles import leaves
+from test_micro_timing import check_global_guard
+from export_safe_elf import export_hash
+from qwen_l3_reference import reference,validate
+from parallel_budget_scheduler import owned
+BASE=R/'results/cacheflex_flash_attention/bottleneck_20261004';G=R/'results/cacheflex_flash_attention/pv_diag_20261005/guest_v1';ROOT=R/'results/cacheflex_flash_attention/phase_profile_20261005';B=ROOT/'build_v1';OUT=ROOT/(os.environ['FA49_ARM']+('_target' if os.environ.get('FA49_TARGET')=='1' else ''));GIB=2**30
+PARENT=R/'results/retained_protocol_restart_20261002/fa_matrix_spm_only/runs/t256_q14_legacy_v_br16_bc256_r256'
+ENV=dict(os.environ,CACHEFLEX_NCC_PROBE='1',LD_LIBRARY_PATH='/data2/rsappidi/conda-envs/cacheflex-gem5/lib')
+def read(p):return json.loads(Path(p).read_text())
+def save(p,v):
+ p=Path(p);tmp=p.with_suffix('.tmp');tmp.write_text(json.dumps(v,indent=2)+'\n');tmp.replace(p)
+def sha(p):
+ h=hashlib.sha256()
+ with Path(p).open('rb') as f:
+  for b in iter(lambda:f.read(4*1024*1024),b''):h.update(b)
+ return h.hexdigest()
+def pressure():
+ monitor=read(R/'results/retained_protocol_restart_20261002/spm_only_resources.json')
+ mem={l.split(':')[0]:int(l.split()[1])*1024 for l in Path('/proc/meminfo').read_text().splitlines()}
+ # Host coordinator accounts all host processes; sandbox RSS is added conservatively.
+ rss=monitor['user_rss_bytes']+sum(v['rss'] for v in owned().values());cap=monitor['ram_limit_bytes']
+ return time.time()-monitor['updated']>30 or rss>cap-2*GIB or mem['MemAvailable']<64*GIB+max(0,cap-rss)
+def config_check(path,c,cmd):
+ old=dict(leaves(read(PARENT/'config.json')));new=dict(leaves(read(path/'config.json')))
+ expected=dict(old)
+ # Normalize only output-root redirects, then explicitly set expected guest/argv.
+ for k,v in list(expected.items()):
+  if isinstance(v,str):expected[k]=v.replace(str(PARENT),str(path))
+ if c['kind']=='fa':
+  expected.update(parameters(c['variant'],c['spm']))
+  expected['system.cpu[0].workload[0].executable']=str(G/'guest.export-safe')
+  args=['kv-fa',*map(str,argv(c))]
+  for i,x in enumerate(args):expected[f'system.cpu[0].workload[0].cmd[{i}]']=x
+ assert new==expected,{k:[expected.get(k),new.get(k)] for k in expected.keys()|new.keys() if expected.get(k)!=new.get(k)}
+ assert cmd[cmd.index('--cmd')+1]==new['system.cpu[0].workload[0].executable']
+ return {k:[old.get(k),new.get(k)] for k in old.keys()|new.keys() if old.get(k)!=new.get(k)}
+def command(c,path):
+ cmd=read(PARENT/'command.json');cmd[0]=str(B/'gem5.opt');cmd[1]='--outdir='+str(path)
+ if c['kind']=='fa':
+  cmd[cmd.index('--cmd')+1]=str(G/'guest.export-safe');cmd[cmd.index('--options')+1]=' '.join(map(str,argv(c)))
+  cmd[cmd.index('--l1d_num_spm_ways=6')]='--l1d_num_spm_ways='+str(6 if c['spm'] else 0)
+  for i,x in enumerate(cmd):
+   if x.startswith('system.cpu[0].workload[0].cmd='):cmd[i]='system.cpu[0].workload[0].cmd='+repr(['kv-fa',*map(str,argv(c))])
+  for k,v in parameters(c['variant'],c['spm']).items():
+   found=[i for i,x in enumerate(cmd) if x.startswith(k+'=')]
+   if found:
+    for i in found:cmd[i]=k+'='+repr(v)
+   else:cmd+=['-P',k+'='+repr(v)]
+ return cmd
+def main():
+ def stop(signum,frame):raise KeyboardInterrupt('termination requested')
+ signal.signal(signal.SIGTERM,stop)
+ OUT.mkdir(parents=True,exist_ok=False);(OUT/'runs').mkdir();(OUT/'references').mkdir()
+ lock=(OUT/'coordinator.lock').open('w');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+ budget=read(R/'results/parallel_budget_20260929/budget.json');os.sched_setaffinity(0,budget['cpu_set'][int(os.environ['FA49_CPU_OFFSET']):int(os.environ['FA49_CPU_OFFSET'])+2]);os.nice(10)
+ resource.setrlimit(resource.RLIMIT_AS,(2*GIB,resource.RLIM_INFINITY))
+ plan=cases();state=dict(pid=os.getpid(),stage='preparing',active={},pending=[c['name'] for c in plan],completed=[],failed=[])
+ def status():state['updated']=time.time();save(OUT/'status.json',state)
+ status();save(OUT/'plan.json',dict(cases=plan,max_simulators=1,attribution='paired fractional latency reduction; SPM gain minus cache gain; never subtract overlapping counters',scope='new guest both backends, same shapes/math; only named resource overrides'))
+ frozen=read(G/'frozen.json');frozen.update(read(B/'link_inputs.json'));frozen[str(B/'gem5.opt')]=sha(B/'gem5.opt');frozen[str(B/'hook.hh')]=sha(B/'hook.hh');frozen.update(read(R/'results/retained_protocol_restart_20261002/build/frozen.json'))
+ for f in [*H.glob('*.py'),*H.glob('*.hh'),B/'observer.hh',B/'phase_api.hh',B/'Sequencer.cc',B/'lsq_unit.cc',B/'pseudo_inst.cc',B/'original_sources.json',*PARENT.glob('*.json'),Path(read(PARENT/'command.json')[0]),Path(read(PARENT/'command.json')[2])]:
+  if f.is_file():frozen[str(f)]=sha(f)
+ for mod in (broker,sys.modules['run_access_timing'],sys.modules['fa_headroom_profiles'],sys.modules['qwen_l3_reference'],sys.modules['fa_independent_reference'],sys.modules['export_safe_elf'],sys.modules['test_micro_timing'],sys.modules['parallel_budget_scheduler']):
+  f=Path(mod.__file__);frozen[str(f)]=sha(f)
+ frozen[str(PARENT/'output.fp16')]=sha(PARENT/'output.fp16');frozen[str(PARENT/'stats.txt')]=sha(PARENT/'stats.txt')
+ for c in plan:
+  control=control_path(c)
+  if control is None:continue
+  for name in ('accepted.json','output.fp16','stats.txt','command.json','config.json'):
+   frozen[str(control/name)]=sha(control/name)
+  assert sha(control/'output.fp16')==read(control/'accepted.json')['output_sha256']
+  if c['spm']:
+   old=R/'results/cacheflex_flash_attention/pv_diag_20261005/spm_inert/runs'/f't{c["t"]}_spm_inert'
+   for name in ('accepted.json','stats.txt','config.json','command.json','output.fp16'):frozen[str(old/name)]=sha(old/name)
+ save(OUT/'inputs.json',frozen)
+ def unchanged():
+  for p,h in frozen.items():assert sha(p)==h,('frozen input drift',p)
+ def acquire(ticket):
+  while True:
+   state['stage']='waiting_for_reservation';status()
+   with broker.locked() as s:
+    if time.time()-s['heartbeat']<20 and not s['hold_new'] and not pressure() and broker.total(s)+10*GIB<=s['cap']:
+     assert ticket not in s['leases'];s['leases'][ticket]=dict(bytes=10*GIB,owner=os.getpid(),family='FA-49');return
+   time.sleep(5)
+ try:
+  for c in plan:
+   ticket='fa49_'+os.environ['FA49_ARM']+'_'+c['name'];acquire(ticket);path=OUT/'runs'/c['name'];path.mkdir();proc=None
+   try:
+    unchanged();cmd=command(c,path);save(path/'command.json',cmd);limit=8*GIB
+    def child():resource.setrlimit(resource.RLIMIT_AS,(limit,resource.RLIM_INFINITY))
+    replay=OUT/'disabled_replay'
+    source=replay/'runs'/c['name']
+    reused=source.is_dir()
+    if reused:
+     receipt=read(replay/'replay_verified.json')['raw_sha256']
+     for rel,digest in receipt.items():
+      if rel.startswith('runs/'+c['name']+'/'):assert sha(replay/rel)==digest,('replay drift',rel)
+     assert read(source/'command.json')==cmd,'replay command changed'
+     shutil.copytree(source,path,dirs_exist_ok=True)
+     save(path/'replay_provenance.json',dict(source=str(source),verified_receipt=sha(replay/'replay_verified.json')))
+     code=0
+    else:
+     case_env=dict(ENV,CACHEFLEX_PV_DIAG_FLAGS='0',CACHEFLEX_PV_PHASE_MAP=str(G/'phase_map.txt') if c['observer'] else '')
+     save(path/'environment.json',{k:v for k,v in case_env.items() if k.startswith('CACHEFLEX_')})
+     with (path/'run.log').open('w') as log:proc=subprocess.Popen(cmd,cwd=R,env=case_env,stdout=log,stderr=subprocess.STDOUT,preexec_fn=child)
+     state['stage']='running_'+c['name'];state['active']={c['name']:dict(pid=proc.pid,path=str(path),paused=False,simulator_as=limit)};status();start=time.monotonic();paused=False;last_progress=start;last_signature=None
+     while proc.poll() is None:
+      assert time.monotonic()-start<(1800 if c['t']==256 else 5400),'case wall timeout'
+      with (path/'run.log').open('rb') as progress_log:
+       progress_log.seek(max(0,(path/'run.log').stat().st_size-16384));tail=progress_log.read().decode(errors='replace')
+      retired={int(i):int(n) for i,n in re.findall(r'system.cpu(\d+) progress event, total committed:(\d+)',tail)}
+      signature=tuple(sorted(retired.items()))
+      if paused or signature!=last_signature:last_progress=time.monotonic();last_signature=signature
+      assert time.monotonic()-last_progress<120,'no guest instruction progress for120hostseconds'
+      state['guest_progress']=dict(last_change=time.time()-(time.monotonic()-last_progress),retired=retired)
+      hold=pressure();info=owned().get(proc.pid)
+      if info and info['vms']>=limit-GIB:
+       with broker.locked() as s:
+        if not hold and broker.total(s)+4*GIB<=s['cap']:
+         s['leases'][ticket]['bytes']+=4*GIB;limit+=4*GIB;resource.prlimit(proc.pid,resource.RLIMIT_AS,(limit,resource.RLIM_INFINITY))
+        else:hold=True
+      if hold!=paused:proc.send_signal(signal.SIGSTOP if hold else signal.SIGCONT);paused=hold
+      state['active'][c['name']].update(paused=paused,simulator_as=limit);status()
+      try:proc.wait(timeout=5)
+      except subprocess.TimeoutExpired:pass
+     code=proc.returncode
+    log=(path/'run.log').read_text();assert code==0 and 'because exiting with last active thread context' in log,log[-3000:]
+    assert not re.search(r'panic:|fatal:|\bFAIL\b',log),log[-3000:]
+    delta=config_check(path,c,cmd);blocks=stats(path);s=blocks[0]
+    for block in blocks:
+     check_global_guard(block)
+     for i in range(8):
+      for domain in ('regular','spm'):
+       for kind,cap in [('Load',32),('Store',48)]:assert block[f'system.cpu{i}.{domain}Lsq0.boundedMax{kind}Occupancy']<=cap
+    if c['kind']=='exact':
+     assert blocks==stats(PARENT),'default simulator statistics changed'
+     assert sha(path/'output.fp16')==sha(PARENT/'output.fp16')
+     row=dict(name=c['name'],case=c,path=str(path),outcome='exact_default_control',roi_us=s['simTicks']/1e6,config_delta=delta)
+    else:
+     ref=OUT/'references'/f't{c["t"]}.npy'
+     if not ref.exists():np.save(ref,reference(c['t'],256,14,2,True))
+     frozen[str(ref)]=sha(ref);save(OUT/'inputs.json',frozen)
+     export_hash(path/'output.fp16',log);arithmetic=validate(path/'output.fp16',np.load(ref),c['t'],14,2,True,dense=c['t']<=256)
+     tasks,updates,expected=work(c['t']);actual={int(i):(int(t),int(u)) for i,t,u in re.findall(r'GQA_WORK core=(\d+) tasks=(\d+) row_updates=(\d+)',log)}
+     assert actual=={i:(tasks[i],updates[i]) for i in range(8)},actual
+     copies=sum(v for k,v in s.items() if k.endswith('.m_spmcpRequestsIssued'))
+     assert copies==(expected if c['spm'] else 0)
+     assert copies==sum(v for k,v in s.items() if k.endswith('.m_spmcpRequestsCompleted'))
+     assert sum(v for k,v in s.items() if k.endswith(('.reductionAccepted','.l3ReductionStarts')))==0
+     assert f'BOTTLENECK stage_simple={int(c["variant"]=="stage")} packed_producer={int(c["variant"]=="packed")}' in log
+     digest=sha(path/'output.fp16')
+     control=control_path(c)
+     if control is not None:assert digest==read(control/'accepted.json')['output_sha256'],'accepted control output differs'
+     assert f'NCC_CONFIG mode={c["mode"]}' in log
+     if c['mode']:
+      counts={int(i):(int(pv),int(kp),int(pp),int(cy)) for i,pv,kp,pp,cy in re.findall(r'NCC_COUNTS core=(\d+) pv=(\d+) kpack=(\d+) ppack=(\d+) service_cycles=(\d+)',log)}
+      expected_counts={i:(updates[i]//16 if 3<=c['mode']<=8 else 0,(2*c['t']//128+7-i)//8 if c['mode']==1 else 0,updates[i]//16 if c['mode']==2 else 0,(updates[i]//16)*service(c['mode'],c['flags'])) for i in range(8)}
+      assert counts==expected_counts,(counts,expected_counts)
+      transfers={int(i):(int(ib),int(ob),int(polls)) for i,ib,ob,polls in re.findall(r'NCC_TRANSPORT core=(\d+) input_bytes=(\d+) output_bytes=(\d+) polls=(\d+)',log)}
+      for i,(pv,kp,pp,cy) in expected_counts.items():
+       assert transfers[i][:2]==(pv*8192+kp*16384+pp*8192,pv*2048+kp*16384+pp*8192),(i,transfers)
+       assert transfers[i][2]>=pv+kp+pp
+     assert f'ASYNC_CONFIG enabled={c["async_pv"]} depth=1 alpha_bytes=64' in log
+     completions={int(i):(int(a),int(b)) for i,a,b in re.findall(r'ASYNC_WORK core=(\d+) submitted=(\d+) completed=(\d+)',log)}
+     assert completions=={i:((updates[i]//16,)*2 if c['mode'] else (0,0)) for i in range(8)},completions
+     overlap={int(i):dict(work_ticks=int(w),overlap_ticks=int(o),regions=int(r),ready_polls=int(y),blocked_polls=int(n),v_checks=int(v)) for i,w,o,r,y,n,v in re.findall(r'NCC_OVERLAP core=(\d+) work_ticks=(\d+) overlap_ticks=(\d+) regions=(\d+) ready_polls=(\d+) blocked_polls=(\d+) v_checks=(\d+)',log)}
+     if c['mode']:
+      assert set(overlap)==set(range(8)),overlap
+      for i,x in overlap.items():
+       assert x['regions']==updates[i]//16 and x['v_checks']==updates[i]//256,(i,x)
+       assert 0<=x['overlap_ticks']<=x['work_ticks'],(i,x)
+       assert x['ready_polls']+x['blocked_polls']==transfers[i][2],(i,x)
+       assert x['ready_polls']==updates[i]//16,(i,x)
+       if not c['async_pv']:assert x['overlap_ticks']==0,(i,x)
+      if c['async_pv'] and not c['flags']&2:assert sum(x['overlap_ticks'] for x in overlap.values())>0,'No useful CPU/engine overlap observed'
+      if c['flags']&2:assert sum(x['overlap_ticks'] for x in overlap.values())==0
+     assert f'PV_DIAG flags={c["flags"]}' in log
+     if c['flags']&1:assert sum(v for k,v in s.items() if k.endswith('.spmLsq0.spmLoadResponses'))==0,'Removed probe still generated SPM loads'
+     if c['flags']&2:assert sum(x['blocked_polls'] for x in overlap.values())==0,'Zero-service command was not ready'
+     phase_rows={i:{} for i in range(8)}
+     for i,p,t,n in re.findall(r'PV_PHASE core=(\d+) phase=(\d+) ticks=(\d+) entries=(\d+)',log):
+      i,p=int(i),int(p);assert p not in phase_rows[i];phase_rows[i][p]=dict(ticks=int(t),entries=int(n))
+     timeline={int(i):dict(start=int(a),end=int(b),final_arrival=int(f)) for i,a,b,f in re.findall(r'PV_TIMELINE core=(\d+) start=(\d+) end=(\d+) final_arrival=(\d+)',log)}
+     if c['observer']:
+      assert set(timeline)==set(range(8)),timeline
+      for i,x in phase_rows.items():
+       assert set(x)==set(range(26)),(i,x)
+       assert sum(v['ticks'] for v in x.values())==timeline[i]['end']-timeline[i]['start'],(i,x,timeline)
+       assert timeline[i]['start']<timeline[i]['final_arrival']<=timeline[i]['end'],(i,timeline)
+       for phase in (5,6,7):assert x[phase]['entries']==updates[i]//16,(i,phase,x[phase],updates[i])
+     else:assert not timeline and not any(phase_rows.values())
+     observer_equivalence=None
+     if c['arm'] in ('spm','cache'):
+      peer=ROOT/(c['arm']+'_off')/'runs'/f't{c["t"]}_{c["arm"]}_off'
+      wait_begin=time.monotonic()
+      while not (peer/'accepted.json').exists():
+       assert time.monotonic()-wait_begin<600,'OFF observer control unavailable'
+       time.sleep(2)
+      assert blocks==stats(peer),'Passive observer changed non-host statistics'
+      assert digest==read(peer/'accepted.json')['output_sha256']
+      peer_config=dict(leaves(read(peer/'config.json')))
+      normalized={k:(v.replace(str(peer),str(path)) if isinstance(v,str) else v) for k,v in peer_config.items()}
+      assert normalized==dict(leaves(read(path/'config.json'))),'Observer config difference'
+      for name in ('accepted.json','stats.txt','config.json','command.json','output.fp16'):
+       frozen[str(peer/name)]=sha(peer/name)
+      save(OUT/'inputs.json',frozen)
+      observer_equivalence=dict(peer=str(peer),all_nonhost_stats_exact=True,all_output_bits_exact=True)
+     details={i:{} for i in range(8)};pending={}
+     for line in log.splitlines():
+      if line.startswith(('FA_DETAIL ','FA_PENDING ')):
+       v={k:int(n) for k,n in re.findall(r'(\w+)=(\d+)',line)};i=v.pop('core')
+       if line.startswith('FA_DETAIL '):
+        p=v.pop('phase');assert p not in details[i];details[i][p]=v
+       else:assert i not in pending;pending[i]=v
+     if c['observer']:
+      assert set(pending)==set(range(8)),pending
+      clock=read(path/'config.json')['system']['cpu_clk_domain']['clock'][0]
+      for i,d in details.items():
+       assert set(d)==set(range(26)),(i,d)
+       totals={k:sum(p[k] for p in d.values()) for k in next(iter(d.values()))}
+       assert totals['copy_issue']==totals['copy_done']==(updates[i]*2 if c['spm'] else 0),(i,totals)
+       assert totals['copy_area']==totals['copy_latency'],(i,totals)
+       assert totals['raw_start']==totals['raw_done']+totals['raw_squash'],(i,totals)
+       assert totals['raw_start']==s[f'system.cpu{i}.spmLsq0.spmRawBlockedUniqueLoads'],(i,totals)
+       assert totals['raw_latency']/clock==s[f'system.cpu{i}.spmLsq0.spmRawWaitCycles'],(i,totals)
+       assert totals['spm_port_block']==s[f'system.cpu{i}.spmLsq0.spmPortBlockedEvents'],(i,totals)
+       assert pending[i]['copies']==pending[i]['raw']==pending[i]['spm']==0,(i,pending)
+       assert max(pending[i][k] for k in ('copy_max','raw_max','cache_max','spm_max'))<=256,(i,pending)
+       for kind in ('cache','spm'):
+        assert totals[kind+'_issue']==totals[kind+'_done']+pending[i][kind],(i,kind,totals,pending)
+       for p,v in d.items():
+        for kind in ('copy','raw','cache','spm'):
+         assert 0<=v[kind+'_busy']<=phase_rows[i][p]['ticks'],(i,p,kind,v)
+         assert v[kind+'_area']>=v[kind+'_busy'],(i,p,kind,v)
+       if not c['spm']:assert not any(totals[k] for k in totals if k.startswith(('copy_','raw_','spm_'))),(i,totals)
+     else:assert not pending and not any(details.values())
+     historical_equivalence=None
+     if c['spm']:
+      old=R/'results/cacheflex_flash_attention/pv_diag_20261005/spm_inert/runs'/f't{c["t"]}_spm_inert'
+      assert blocks==stats(old),'Observer rebuild changed accepted SPM non-host stats'
+      assert digest==read(old/'accepted.json')['output_sha256']
+      historical_equivalence=dict(peer=str(old),all_nonhost_stats_exact=True)
+      for name in ('accepted.json','stats.txt','config.json','command.json','output.fp16'):frozen[str(old/name)]=sha(old/name)
+      save(OUT/'inputs.json',frozen)
+     for prev in state['completed']:
+      if prev['case']['kind']=='fa' and prev['case']['t']==c['t']:assert prev['output_sha256']==digest,'matched output bits changed'
+     row=dict(name=c['name'],case=c,path=str(path),outcome='full_fa_pass',roi_us=s['simTicks']/1e6,arithmetic=arithmetic,copies=copies,overlap=overlap,phases=phase_rows,timeline=timeline,observer_equivalence=observer_equivalence,phase_details=details,pending_at_end=pending,historical_equivalence=historical_equivalence,output_sha256=digest,config_delta=delta)
+    unchanged();save(path/'accepted.json',row);state['completed'].append(row);state['pending'].remove(c['name']);state['active']={};status()
+    save(OUT/'summary.json',state['completed'])
+   finally:
+    if proc is not None and proc.poll() is None:
+     proc.terminate();proc.send_signal(signal.SIGCONT)
+     try:proc.wait(timeout=10)
+     except subprocess.TimeoutExpired:proc.kill();proc.wait()
+    broker.release(ticket)
+  state['stage']='complete';status()
+ except BaseException as e:
+  state['stage']='failed';state['active']={};state['failed'].append(dict(error=repr(e),traceback=traceback.format_exc()));status();raise
+if __name__=='__main__':main()

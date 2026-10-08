@@ -1,0 +1,94 @@
+Qwen placement and ownership model, MOD-12 (2026-09-30)
+
+Implementation
+  scripts/qwen_placement_model.py: declarative candidate, accounting, layouts,
+    phase dependency graph, resource rooflines, calibration and enumeration.
+  scripts/run_qwen_placement_model.py: accepted-only ingestion, complete hardware
+    profile comparison, accounting validation, withheld-size evaluation, plans.
+  scripts/check_qwen_placement_plan.py: fail-closed handoff schema/resource check.
+  scripts/test_qwen_placement_model.py: independent counts and schedule invariants.
+
+Run from repository root (output directory must not exist):
+  python3 scripts/run_qwen_placement_model.py --out results/my_placement_audit
+  python3 scripts/check_qwen_placement_plan.py results/my_placement_audit/experiment_plan.json
+  python3 -m unittest discover -s scripts -p test_qwen_placement_model.py -v
+
+The analysis uses one CPU from the established affinity and at most 2 GiB address
+space. It never starts a simulator, edits frozen runners, or changes admission.
+Plan emission is a reviewable interface, NOT a running experimental queue.
+
+Space and exact accounting
+  Eight cores, d64, batch1, Br16; Bc128/256/512. Causal and noncausal counts.
+  Legacy rotated query groups: R128/256/512; query-head complementary ownership;
+  KV complementary ownership. Query placement cache/V/QV/OV/QO/QOV and static KV
+  group/all-head lifetimes. Static K is one packed representation, not an extra
+  duplicate. Q and O are coherent in KV candidates; partial merge state has a
+  320B padded record (FP32 O[64], maximum, denominator). Numerical merge must
+  rescale to a shared maximum; it is not a raw addition of normalized outputs.
+
+  Source loops determine rectangular tile arithmetic, useful causal pairs,
+  per-core updates/tasks, Q packing, explicit source-copy bytes, zero-O bootstrap,
+  releases, partial records, output traffic. Scores may compute masked diagonal
+  entries. Future-only tiles are skipped. Merge-owner rotation is specified.
+  Physical slots are enumerated; overlaps/overflow are rejected. Query layouts
+  match FA-33; stride512 redistributes the same logical slots. KV linear-64B
+  layout is an abstract candidate ABI, requiring checked wide-load lowering.
+  Copies are source payloads, not measured DRAM bytes or NoC flits.
+
+Timing model and its limits
+  Max-plus phase graph separates install/pack, QK, softmax/P packing, PV, and
+  merge/export, with per-head barriers for the head schedule and independent
+  core chains for legacy scheduling. Issue/compute/SPM/memory demands overlap
+  through a maximum within phases; dependent phases serialize. Kernel tile
+  interleaving is aggregated, not simulated. KV blockwise merge dependencies are
+  not fully resolved by this approximation. No exact FIFO contention model exists.
+  The dependency-only synchronization option is optimistic overlap, not a proven
+  legal substitute for DSB. The ideal broadcast option is a diagnostic, not an ISA
+  implementation. Neither is automatically selected for execution.
+
+  Assumed effective bandwidth/compute/copy/pressure scenarios are ranked using
+  T1024 timings and a fitted positive global scale. They are not synthesized
+  hardware rates. Instruction work, cache-miss fractions, set pressure and
+  runtime are estimates, explicitly separate from exact accounting. No exact
+  cache conflict or coherence prediction is claimed without physical addresses.
+  Reported ranges are sensitivity envelopes, NOT confidence intervals or proven
+  runtime bounds. Ratios of stall counters are not used as runtime fractions.
+
+Validation
+  FA-33's 18 accepted records supply full-output/config gates. All modeled copy,
+  task and update counts are checked independently per core against them.
+  Full configuration comparison excludes only guest argv, output-directory
+  filesystem redirects and eligible-SPM-way count. No mixed queue/clock/NoC
+  profiles are silently pooled. T256 timings are correctness gates only.
+  Calibrate on six T1024 arms; evaluate six T4096 arms without refitting. T4096
+  is withheld from coefficient fitting, not a blind independent study: its
+  behavior was already known during model design. Thresholds: <=15% MAPE,
+  >=80% pair ordering agreement excluding measured pairs within1%, and expected
+  QO/cache, QOV/QO and QOV/V directions. Successful evaluation would still not
+  validate unmeasured KV merge behavior or guarantee an optimum.
+
+  First timing model fails: 22.4% MAPE,21.4% pair ordering agreement. It therefore
+  must NOT promote its numerical ranking as a winning configuration selection.
+  This failed result is retained, not hidden by refitting T4096. Counter diagnosis
+  is generated after calibration and never feeds held-out counters into predictions.
+
+Next evidence / handoff
+  Information-gain plan: QV and OV; KV-owned coherent control; resident K+V per
+  KV group; resident both KV heads. New guests and runner adapters are explicitly
+  missing. The plan includes baseline controls, full numerical/config/work gates,
+  end-to-end decision criterion, and existing shared broker/20%CPU-RAM policy.
+  It does not write to any existing simulation queue.
+
+  To improve the predictor: measure set/operand-specific coherent reuse and
+  placement-induced core imbalance; separate Q adapter and accumulator ordering
+  with QV/OV; validate and measure a software KV merge. A corrected model must
+  retain this failure and obtain fresh validation before claiming predictive power.
+
+Prior evidence
+  FA-03/31: displacement/mapping; FA-10: costly Q broadcast adapter; FA-14: async
+  staging not universally beneficial; FA-25/26/27: output residency/forwarding/
+  early address tests; FA-28/29: persistent KV ownership can reduce copies and
+  still lose to better query tuning; FA-33: new combined-residency factorial.
+  New work is placement/ownership/lifetime selection in one numerical model.
+  The decision metric remains complete ROI versus matched control AND strongest
+  private/cache reference; sparse bounded search is not global optimality proof.

@@ -1,0 +1,65 @@
+FA-35: bounded T4096 Qwen placement/geometry matrix (2026-09-30)
+
+User authorized missing placement cases plus a comprehensive, justified kernel
+parameter matrix. No claim of a true/global optimum outside the tested space.
+Related FA-33: completed QO/QOV negative vs V. FA-10/25-27: Q adapter/output
+ordering costs already tested historically. FA-28/29: KV partition and analytical
+tuning already tested on older single-head cases. L3-11/12: Qwen R/Bc neighbors
+at Br16. MOD-12 timing ranking failed; use exact counts/capacity only.
+
+New same-ELF families:
+  0 legacy query-cache;1 legacy query-V;8 legacy query-L3 reduction.
+  2 balanced-head cache;3 V;4 QO;5 QOV;6 QV;7 OV.
+  9 complementary KV ownership coherent;10 static K+V per KV group;
+  11 static both KV heads. KV software softmax merge; no new hardware or ring.
+Balanced heads now allow smaller complementary R slices, preserving unique output
+ownership. All old and new families get same-ELF controls; archived winners remain
+independent performance targets. New ELF/alignment effects are not architecture.
+
+Target batch1,T4096,Hq14,Hkv2,d64,FP16 input/GEMM,FP32 state,causal,8cores,VL16.
+Frozen direct-link build_v4 and its matched cache/private/NoC configuration trees.
+Direct link OFF; existing NoC L3 engine in mode8 only. No port/bank/queue changes.
+Br16/32/64; Bc128/256/512; legacy/head R128/256/512; KV merge-batch R16/64/128/256.
+KV Bc512 rejected: each complementary ownership interval is256 tokens. No
+silent Bc truncation; a larger ownership-chunk design is a distinct future family.
+Head R must be divisible by2Br. Physical slot bounds checked before launch.
+
+12 anchors,72 valid one-axis changes atT4096, at most4 crossed configurations per
+family from its two best measured levels, then at most2 untested nearest neighbors
+per measured family winner. Maximum156 target cases, typically fewer; small gates
+deduplicated separately. No family eliminated using MOD-12's failed predictions.
+Missing QV/OV anchors first. Equal maximum interaction budget. Unchecked neighbors
+explicitly recorded. A boundary winner is a boundary of this search, not a proof
+that larger parameters cannot win. Original R/Bc points are revalidations under
+the new ELF, not novel untested optimizations.
+
+Static KV concrete layout: packed K uses ways0-3 (four64B segments per128-key
+column); V uses ways4-5. AtT4096 a KVgroup needs128KiB/core; bothheads256KiB.
+Each physical K/V element is installed once per FA operation in both variants.
+Q and output partials coherent; causal future-only Br blocks skipped. Partial
+max/denominator/output merge occurs in core order using stable rescaling, with
+barriers before merge and before partial storage reuse. This changes FP rounding
+order versus query ownership: its independent full oracle and bit-equivalence
+class are separate; tolerances unchanged. No comparison of query/KV exact hashes.
+
+All candidates first get a smaller full-output check of that Br/Bc/placement.
+Query gates use T>=16Br andT>=Bc; KV gates T>=2048 andT>=16Bc,Hq2/Hkv2.
+T4096/Hq14 targets each independently validate ALL outputs too, including group
+reuse. Exact per-core tasks/updates/copies, exported hash, first-row identity,
+same-arithmetic-class/Bc exact peer bits, full configuration deltas, finite LSQ/
+source/sink/bank bounds, command/initialization/transport counts, and zero global
+resource rejects are required. Failure stops this matrix's peers/downstream.
+All packing, initialization, staging, synchronization, merge and export timed.
+
+Resource policy: same atomic OPS-23 broker, at most4 new simulators,8GiB reservation
+each (6GiB initial AS plus margin), proactive4GiB growth only when total fits20%
+RAM. Same24CPU affinity and all-user sampled CPU/RAM guard,64GiB extra server
+headroom. Coordinator2GiB and single-thread NumPy within existing outside reserve.
+Old simulations untouched. If old supervisor completes and exits, renew its
+existing broker conservatively without deleting reservations/other leases.
+
+Artifacts: plan.json, per-stage plans, independent references, frozen inputs,
+accepted/failed records, winners.json, measured interaction/neighbor selections.
+Complete ROI must beat same-family/control and strongest prior reference to
+change the performance decision. Reports distinguish validation from targets;
+no unsupported ring, synthesized hardware, or full-model inference claim.

@@ -1,0 +1,15 @@
+{
+  "checks": {
+    "run.py:pressure": "identical AST",
+    "run.py:config_check": "identical AST",
+    "run.py:command": "identical AST",
+    "plan.py:parameters": "identical AST",
+    "plan.py:work": "identical AST",
+    "plan.py:argv": "identical AST"
+  },
+  "parents": {
+    "benchmarks/qwen/fa/bottleneck/run.py": "d4e74a2459284e9cc763a2c38e56d0d70307a2d831ecee3c697b61911837d8c9",
+    "benchmarks/qwen/fa/bottleneck/plan.py": "ffe26ca3f996c6c7dfc26aa4070ffbf270dc62357eb5b8bd619f930e8419b1f1",
+    "benchmarks/qwen/fa/bottleneck/report.py": "8a11f7f088e6d93f62b8f5150f2d30128216d804ec4933873da3bcd567da5b8d"
+  }
+}

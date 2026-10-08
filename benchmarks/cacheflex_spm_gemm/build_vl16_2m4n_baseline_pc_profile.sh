@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export CACHEFLEX_PROFILE_DEFINE=-DCACHEFLEX_KERNEL_PC_LABELS
+export CACHEFLEX_BUILD_OUT="$SCRIPT_DIR/bin_gem5/cache_vl16_2m4n_pc_profile"
+exec "$SCRIPT_DIR/build_vl16_2m4n_baseline.sh"
